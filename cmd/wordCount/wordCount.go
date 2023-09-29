@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -20,15 +21,130 @@ const (
 	APP     = "wordCount"
 )
 
-/*
-better use a type to store word
+type CountResults struct {
+	LineCount       int
+	RuneCount       int
+	RuneLetterCount int
+	DistinctWords   int
+	TotalWords      int
+}
 
-	type WordCounter struct {
-		err error
-		msg string
-		List map[string]int
+type ConfigWordStore struct {
+	minWordLength int
+	toLower       bool
+	removeAccent  bool
+}
+
+type WordStore struct {
+	words         map[string]int
+	totalNumWords int
+	config        *ConfigWordStore
+	log           *log.Logger
+	lock          sync.RWMutex
+}
+
+func NewWordStore(config *ConfigWordStore, log *log.Logger) *WordStore {
+	w := make(map[string]int, 100)
+	return &WordStore{
+		words:         w,
+		totalNumWords: 0,
+		config:        config,
+		log:           log,
+		lock:          sync.RWMutex{},
 	}
-*/
+}
+
+var transformerRemoveAccent = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+
+func (w *WordStore) AddWordCount(word string) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if utf8.RuneCountInString(word) > w.config.minWordLength {
+		currentWord := word
+		w.totalNumWords += 1
+		if w.config.toLower == true {
+			currentWord = strings.ToLower(currentWord)
+		}
+		if w.config.removeAccent == true {
+			unAccentedWord, _, _ := transform.String(transformerRemoveAccent, currentWord)
+			w.words[unAccentedWord]++
+		} else {
+			w.words[currentWord]++
+		}
+	}
+}
+
+func (w *WordStore) Count() int {
+	w.lock.RLock()
+	defer w.lock.RUnlock()
+	return len(w.words)
+}
+
+func (w *WordStore) GetTotalWordsFound() int {
+	w.lock.RLock()
+	defer w.lock.RUnlock()
+	return w.totalNumWords
+}
+
+func (w *WordStore) List() map[string]int {
+	w.lock.RLock()
+	defer w.lock.RUnlock()
+	return w.words
+}
+
+func (w *WordStore) CountWords(buf []byte) *CountResults {
+
+	lineCount := 1
+	runeCount := 0
+	runeLetterCount := 0
+	size := 0
+	col := 0
+	currentWord := ""
+	for start := 0; start < len(buf); start += size {
+		var r rune
+		r, size = utf8.DecodeRune(buf[start:])
+		if r == utf8.RuneError {
+			b := buf[start]
+			fmt.Printf("[%d:%d](%v)\t%8v\t%#6x\t%#U\n",
+				lineCount, col, start, b, b, b)
+			log.Printf("ERROR 💥 invalid utf8 encoding at offset %d", start)
+		}
+		runeCount += 1
+		col += size
+		if r == '\n' {
+			fmt.Printf("### eol found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
+			col = 0
+			lineCount += 1
+			w.AddWordCount(currentWord)
+			currentWord = ""
+			fmt.Printf("###### starting line %d\t ######\n", lineCount)
+		} else if unicode.IsLetter(r) {
+			runeLetterCount += 1
+			currentWord += anyascii.TransliterateRune(r)
+		} else if unicode.IsSpace(r) {
+			fmt.Printf("### space found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
+			w.AddWordCount(currentWord)
+			currentWord = ""
+		} else {
+			fmt.Printf("### discarded : [%d:%d]\t%8v\t%#6x\t%#U\t%#U\t%s\t['%s']\t(%s)\n",
+				lineCount, runeCount, r, r, r,
+				unicode.SimpleFold(r),
+				runenames.Name(r), anyascii.TransliterateRune(r), getRuneType(r))
+		}
+	}
+	fmt.Printf("### end found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
+	// need to store the last word
+	w.AddWordCount(currentWord)
+	fmt.Printf("Num lines : %d,\tNum words: %d,\tNum Runes: %d,\tNum Letters:%d", lineCount, w.GetTotalWordsFound(), runeCount, runeLetterCount)
+	return &CountResults{
+		LineCount:       lineCount,
+		RuneCount:       runeCount,
+		RuneLetterCount: runeLetterCount,
+		DistinctWords:   w.Count(),
+		TotalWords:      w.GetTotalWordsFound(),
+	}
+}
+
 func getRuneType(c rune) string {
 	var runeType []string
 	if unicode.IsControl(c) {
@@ -76,88 +192,6 @@ func getRuneType(c rune) string {
 	return strings.Join(runeType, ",")
 }
 
-func CountWords(buf []byte, log *log.Logger, minWordLength int, toLower bool, removeAccent bool) map[string]int {
-	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
-	wordDic := make(map[string]int, 100)
-	lineCount := 1
-	wordCount := 0
-	runeCount := 0
-	runeLetterCount := 0
-	size := 0
-	col := 0
-	currentWord := ""
-	for start := 0; start < len(buf); start += size {
-		var r rune
-		r, size = utf8.DecodeRune(buf[start:])
-		if r == utf8.RuneError {
-			b := buf[start]
-			fmt.Printf("[%d:%d](%v)\t%8v\t%#6x\t%#U\n",
-				lineCount, col, start, b, b, b)
-			log.Printf("ERROR 💥 invalid utf8 encoding at offset %d", start)
-		}
-		runeCount += 1
-		col += size
-		if r == '\n' {
-			fmt.Printf("### eol found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
-			col = 0
-			lineCount += 1
-			if utf8.RuneCountInString(currentWord) > minWordLength {
-				wordCount += 1
-				if toLower == true {
-					currentWord = strings.ToLower(currentWord)
-				}
-				if removeAccent == true {
-					unAccentedWord, _, _ := transform.String(t, currentWord)
-					wordDic[unAccentedWord]++
-				} else {
-					wordDic[currentWord]++
-				}
-			}
-			currentWord = ""
-			fmt.Printf("###### starting line %d\t ######\n", lineCount)
-		} else if unicode.IsLetter(r) {
-			runeLetterCount += 1
-			currentWord += anyascii.TransliterateRune(r)
-		} else if unicode.IsSpace(r) {
-			fmt.Printf("### space found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
-			if utf8.RuneCountInString(currentWord) > minWordLength {
-				wordCount += 1
-				if toLower == true {
-					currentWord = strings.ToLower(currentWord)
-				}
-				if removeAccent == true {
-					unAccentedWord, _, _ := transform.String(t, currentWord)
-					wordDic[unAccentedWord]++
-				} else {
-					wordDic[currentWord]++
-				}
-			}
-			currentWord = ""
-		} else {
-			fmt.Printf("### discarded : [%d:%d]\t%8v\t%#6x\t%#U\t%#U\t%s\t['%s']\t(%s)\n",
-				lineCount, runeCount, r, r, r,
-				unicode.SimpleFold(r),
-				runenames.Name(r), anyascii.TransliterateRune(r), getRuneType(r))
-		}
-	}
-	fmt.Printf("### end found at line: %d\tcol: %d\t currentWord : %s\n", lineCount, runeCount, currentWord)
-	// need to store the last word
-	if utf8.RuneCountInString(currentWord) > minWordLength {
-		wordCount += 1
-		if toLower == true {
-			currentWord = strings.ToLower(currentWord)
-		}
-		if removeAccent == true {
-			unAccentedWord, _, _ := transform.String(t, currentWord)
-			wordDic[unAccentedWord]++
-		} else {
-			wordDic[currentWord]++
-		}
-	}
-	fmt.Printf("Num lines : %d,\tNum words: %d,\tNum Runes: %d,\tNum Letters:%d", lineCount, wordCount, runeCount, runeLetterCount)
-	return wordDic
-}
-
 func analyseBuffer(buf []byte, log *log.Logger) {
 	const header = "#[line:col] byte offset  decimal\thex\tUnicode\t\tSimple\tName\tAscii\ttype"
 	size := 0
@@ -197,13 +231,18 @@ func main() {
 		if err != nil {
 			log.Fatalf("unable to read file %s. Error: %v", filename, err)
 		}
-		res := CountWords(content, l, 1, true, true)
+		wordDic := NewWordStore(&ConfigWordStore{
+			minWordLength: 1,
+			toLower:       true,
+			removeAccent:  true,
+		}, l)
+		res := wordDic.CountWords(content)
 		// fmt.Println(res)
-		resText, err := json.MarshalIndent(res, "", "  ")
+		resText, err := json.MarshalIndent(wordDic.List(), "", "  ")
 		if err != nil {
 			fmt.Println("error at json.MarshalIndent", err)
 		}
-		fmt.Printf("\n\nListe finale de %d mots   : \n %s\n", len(res), resText)
+		fmt.Printf("\n\nListe finale de %d mots   : \n %s\n", res.DistinctWords, resText)
 
 	} else {
 		l.Fatal("Expecting first argument to be the text filename ")
